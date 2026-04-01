@@ -89,11 +89,6 @@ Use Anthropic's first-party API directly.
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` |
 | Claude Haiku 4.5 | `claude-haiku-4-5` |
 
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-free-code
-```
-
 ### OpenAI Codex
 
 Use OpenAI's Codex models for code generation. Requires a Codex subscription.
@@ -182,7 +177,8 @@ curl -fsSL https://bun.sh/install | bash
 ```bash
 git clone https://github.com/paoloanzn/free-code.git
 cd free-code
-bun install
+bun build
+./cli
 ```
 
 ### Build Variants
