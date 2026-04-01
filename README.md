@@ -86,23 +86,12 @@ Use Anthropic's first-party API directly.
 | Model | ID |
 |---|---|
 | Claude Opus 4.6 | `claude-opus-4-6` |
-| Claude Opus 4.5 | `claude-opus-4-5` |
-| Claude Opus 4.1 | `claude-opus-4-1` |
-| Claude Opus 4 | `claude-opus-4` |
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` |
-| Claude Sonnet 4.5 | `claude-sonnet-4-5` |
-| Claude Sonnet 4 | `claude-sonnet-4` |
 | Claude Haiku 4.5 | `claude-haiku-4-5` |
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 free-code
-```
-
-Or authenticate via Claude.ai OAuth:
-
-```bash
-free-code /login
 ```
 
 ### OpenAI Codex
@@ -112,16 +101,12 @@ Use OpenAI's Codex models for code generation. Requires a Codex subscription.
 | Model | ID |
 |---|---|
 | GPT-5.3 Codex (recommended) | `gpt-5.3-codex` |
-| GPT-5.2 Codex | `gpt-5.2-codex` |
-| GPT-5.1 Codex | `gpt-5.1-codex` |
-| GPT-5.1 Codex Mini | `gpt-5.1-codex-mini` |
-| GPT-5.1 Codex Max | `gpt-5.1-codex-max` |
 | GPT-5.4 | `gpt-5.4` |
-| GPT-5.2 | `gpt-5.2` |
+| GPT-5.4 Mini | `gpt-5.4-mini` |
 
 ```bash
 export CLAUDE_CODE_USE_OPENAI=1
-free-code /login   # OAuth via OpenAI
+free-code
 ```
 
 ### AWS Bedrock
