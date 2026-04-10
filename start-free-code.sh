@@ -4,9 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${GLM_ENV_FILE:-$SCRIPT_DIR/.env.glm}"
 PROJECT_DIR="$SCRIPT_DIR"
+PROJECT_DIR_EXPLICIT=""
 
 if [[ $# -gt 0 && -d "$1" ]]; then
   PROJECT_DIR="$(cd "$1" && pwd)"
+  PROJECT_DIR_EXPLICIT="$PROJECT_DIR"
   shift
 fi
 
@@ -15,6 +17,15 @@ if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+fi
+
+if [[ -z "$PROJECT_DIR_EXPLICIT" && -n "${FREE_CODE_DEFAULT_DIR:-}" ]]; then
+  if [[ -d "$FREE_CODE_DEFAULT_DIR" ]]; then
+    PROJECT_DIR="$(cd "$FREE_CODE_DEFAULT_DIR" && pwd)"
+  else
+    echo "[WARN] FREE_CODE_DEFAULT_DIR does not exist: $FREE_CODE_DEFAULT_DIR"
+    echo "[WARN] Falling back to script directory: $SCRIPT_DIR"
+  fi
 fi
 
 export GLM_API_BASE="${GLM_API_BASE:-https://open.bigmodel.cn/api/coding/paas/v4}"

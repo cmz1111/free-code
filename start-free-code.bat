@@ -11,6 +11,7 @@ set "RELAUNCH_ARGS="
 call :parse_args %*
 
 call :load_local_config
+call :apply_default_project_dir
 
 if not defined GLM_API_BASE set "GLM_API_BASE=https://open.bigmodel.cn/api/coding/paas/v4"
 if not defined GLM_MODEL set "GLM_MODEL=glm-5.1"
@@ -118,6 +119,19 @@ for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%GLM_ENV_FILE%") do (
         if not defined !KEY! set "!KEY!=!VALUE!"
     )
 )
+goto :eof
+
+:apply_default_project_dir
+if defined PROJECT_DIR_EXPLICIT goto :eof
+if not defined FREE_CODE_DEFAULT_DIR goto :eof
+
+if exist "%FREE_CODE_DEFAULT_DIR%" (
+    for %%I in ("%FREE_CODE_DEFAULT_DIR%") do set "PROJECT_DIR=%%~fI"
+    goto :eof
+)
+
+echo [WARN] FREE_CODE_DEFAULT_DIR does not exist: %FREE_CODE_DEFAULT_DIR%
+echo [WARN] Falling back to script directory: %SCRIPT_DIR%
 goto :eof
 
 :parse_args

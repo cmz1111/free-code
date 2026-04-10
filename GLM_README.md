@@ -52,6 +52,7 @@ cp .env.glm.example .env.glm
 | `GLM_API_BASE` | 智谱接口基础地址 | `https://open.bigmodel.cn/api/coding/paas/v4` |
 | `GLM_MAX_TOKENS` | 最大输出 token 数 | `131072` |
 | `GLM_TEMPERATURE` | 温度参数 | `0.2` |
+| `FREE_CODE_DEFAULT_DIR` | 默认工作目录，未传目录参数时生效 | 脚本所在目录 |
 
 ## 快速开始
 
@@ -91,6 +92,7 @@ export GLM_API_KEY="your_glm_api_key"
 GLM_API_KEY=your_glm_api_key
 GLM_MODEL=glm-5.1
 GLM_PROXY_PORT=3827
+FREE_CODE_DEFAULT_DIR=G:\Study\another-project
 ```
 
 然后启动：
@@ -120,6 +122,14 @@ Linux / macOS:
 7. free-code 退出后不会自动关闭代理，方便多个项目窗口共享同一个 GLM 代理
 
 这样可以尽量避免 Windows 上的小窗口、小字体和乱码问题。
+
+工作目录优先级如下：
+
+1. 启动命令传入的目录参数
+2. `.env.glm` 或环境变量中的 `FREE_CODE_DEFAULT_DIR`
+3. `start-free-code` 脚本所在目录
+
+如果 `FREE_CODE_DEFAULT_DIR` 配置了一个不存在的目录，脚本会给出警告，并自动回退到脚本所在目录。
 
 ## 多开 free-code
 
