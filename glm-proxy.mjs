@@ -84,6 +84,27 @@ const DEFAULT_TEMPERATURE = parseFloatValue(
   getSetting("GLM_TEMPERATURE", "0.2"),
   0.2,
 )
+const STREAM_READ_TIMEOUT = parseInteger(
+  getSetting("GLM_STREAM_READ_TIMEOUT", "120000"),
+  120000,
+)
+
+function isTerminationError(err) {
+  if (err instanceof DOMException && err.name === "AbortError") return true
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase()
+    return (
+      msg.includes("terminated") ||
+      msg.includes("aborted") ||
+      msg.includes("cancel") ||
+      msg.includes("timeout") ||
+      msg.includes("client disconnected") ||
+      msg.includes("econnreset") ||
+      msg.includes("socket hang up")
+    )
+  }
+  return false
+}
 
 if (!GLM_API_KEY) {
   console.error("[GLM Proxy] Missing GLM_API_KEY.")
@@ -455,7 +476,7 @@ function closeToolBlock(res, record) {
   record.closed = true
 }
 
-async function streamOpenAIToAnthropic(glmResp, res, model) {
+async function streamOpenAIToAnthropic(glmResp, res, model, clientReq) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -488,126 +509,199 @@ async function streamOpenAIToAnthropic(glmResp, res, model) {
     },
   })
 
-  const reader = glmResp.body?.getReader()
-  if (!reader) {
-    throw new Error("GLM response did not include a readable stream body")
+  // Track client disconnect and read timeout
+  let clientDisconnected = false
+  let readTimeoutTimer = null
+
+  const onClientClose = () => {
+    clientDisconnected = true
+    if (readTimeoutTimer) clearTimeout(readTimeoutTimer)
+    console.warn("[GLM Proxy] Client disconnected — aborting upstream reader")
   }
 
-  const decoder = new TextDecoder()
-  let buffer = ""
+  if (clientReq) {
+    clientReq.on("close", onClientClose)
+  }
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) {
-      break
+  try {
+    const reader = glmResp.body?.getReader()
+    if (!reader) {
+      throw new Error("GLM response did not include a readable stream body")
     }
 
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split(/\r?\n/)
-    buffer = lines.pop() || ""
+    const decoder = new TextDecoder()
+    let buffer = ""
 
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed.startsWith(":")) {
-        continue
-      }
-      if (!trimmed.startsWith("data: ")) {
-        continue
-      }
+    while (!clientDisconnected) {
+      // Set per-chunk read timeout
+      if (readTimeoutTimer) clearTimeout(readTimeoutTimer)
+      readTimeoutTimer = setTimeout(() => {
+        console.warn("[GLM Proxy] Stream read timeout — aborting upstream reader")
+        reader.cancel().catch(() => {})
+      }, STREAM_READ_TIMEOUT)
 
-      const payload = trimmed.slice(6)
-      if (payload === "[DONE]") {
-        continue
-      }
-
-      let data
+      let readResult
       try {
-        data = JSON.parse(payload)
-      } catch {
-        continue
+        readResult = await reader.read()
+      } catch (readErr) {
+        if (isTerminationError(readErr) || clientDisconnected) {
+          break
+        }
+        throw readErr
       }
 
-      const choice = data.choices?.[0] || {}
-      const delta = choice.delta || {}
-      if (choice.finish_reason) {
-        state.finishReason = choice.finish_reason
+      const { done, value } = readResult
+      if (done) {
+        break
       }
 
-      if (data.usage) {
-        state.inputTokens = data.usage.prompt_tokens || state.inputTokens
-        state.outputTokens = data.usage.completion_tokens || state.outputTokens
-      }
+      // Reset read timeout on each successful chunk
+      if (readTimeoutTimer) clearTimeout(readTimeoutTimer)
+      readTimeoutTimer = setTimeout(() => {
+        console.warn("[GLM Proxy] Stream read timeout — aborting upstream reader")
+        reader.cancel().catch(() => {})
+      }, STREAM_READ_TIMEOUT)
 
-      if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
-        const index = ensureThinkingBlock(res, state)
-        writeSSE(res, "content_block_delta", {
-          type: "content_block_delta",
-          index,
-          delta: {
-            type: "thinking_delta",
-            thinking: delta.reasoning_content,
-          },
-        })
-      }
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() || ""
 
-      if (typeof delta.content === "string" && delta.content) {
-        closeThinkingBlock(res, state)
-        const index = ensureTextBlock(res, state)
-        writeSSE(res, "content_block_delta", {
-          type: "content_block_delta",
-          index,
-          delta: { type: "text_delta", text: delta.content },
-        })
-      }
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith(":")) {
+          continue
+        }
+        if (!trimmed.startsWith("data: ")) {
+          continue
+        }
 
-      if (Array.isArray(delta.tool_calls)) {
-        for (const toolCall of delta.tool_calls) {
-          const toolIndex =
-            typeof toolCall.index === "number"
-              ? toolCall.index
-              : state.toolCallsByIndex.size
-          const record = ensureToolBlock(res, state, toolIndex, toolCall)
-          state.hadToolCalls = true
+        const payload = trimmed.slice(6)
+        if (payload === "[DONE]") {
+          continue
+        }
 
-          if (toolCall.function?.arguments) {
-            record.argumentsText += toolCall.function.arguments
-            writeSSE(res, "content_block_delta", {
-              type: "content_block_delta",
-              index: record.index,
-              delta: {
-                type: "input_json_delta",
-                partial_json: toolCall.function.arguments,
-              },
-            })
+        let data
+        try {
+          data = JSON.parse(payload)
+        } catch {
+          continue
+        }
+
+        const choice = data.choices?.[0] || {}
+        const delta = choice.delta || {}
+        if (choice.finish_reason) {
+          state.finishReason = choice.finish_reason
+        }
+
+        if (data.usage) {
+          state.inputTokens = data.usage.prompt_tokens || state.inputTokens
+          state.outputTokens = data.usage.completion_tokens || state.outputTokens
+        }
+
+        if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+          const index = ensureThinkingBlock(res, state)
+          writeSSE(res, "content_block_delta", {
+            type: "content_block_delta",
+            index,
+            delta: {
+              type: "thinking_delta",
+              thinking: delta.reasoning_content,
+            },
+          })
+        }
+
+        if (typeof delta.content === "string" && delta.content) {
+          closeThinkingBlock(res, state)
+          const index = ensureTextBlock(res, state)
+          writeSSE(res, "content_block_delta", {
+            type: "content_block_delta",
+            index,
+            delta: { type: "text_delta", text: delta.content },
+          })
+        }
+
+        if (Array.isArray(delta.tool_calls)) {
+          for (const toolCall of delta.tool_calls) {
+            const toolIndex =
+              typeof toolCall.index === "number"
+                ? toolCall.index
+                : state.toolCallsByIndex.size
+            const record = ensureToolBlock(res, state, toolIndex, toolCall)
+            state.hadToolCalls = true
+
+            if (toolCall.function?.arguments) {
+              record.argumentsText += toolCall.function.arguments
+              writeSSE(res, "content_block_delta", {
+                type: "content_block_delta",
+                index: record.index,
+                delta: {
+                  type: "input_json_delta",
+                  partial_json: toolCall.function.arguments,
+                },
+              })
+            }
           }
         }
       }
     }
+
+    closeThinkingBlock(res, state)
+    closeTextBlock(res, state)
+
+    const orderedToolBlocks = Array.from(state.toolCallsByIndex.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([, record]) => record)
+    for (const record of orderedToolBlocks) {
+      closeToolBlock(res, record)
+    }
+
+    const stopReason = mapFinishReason(state.finishReason, state.hadToolCalls)
+    writeSSE(res, "message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: state.outputTokens },
+    })
+    writeSSE(res, "message_stop", {
+      type: "message_stop",
+      usage: {
+        input_tokens: state.inputTokens,
+        output_tokens: state.outputTokens,
+      },
+    })
+  } catch (streamErr) {
+    if (isTerminationError(streamErr) || clientDisconnected) {
+      console.warn(
+        `[GLM Proxy] Stream ended prematurely (${streamErr instanceof Error ? streamErr.message : String(streamErr)})`,
+      )
+    } else {
+      console.error("[GLM Proxy] Stream error:", streamErr)
+    }
+    // Headers are already sent, so send an SSE error event and end gracefully
+    try {
+      closeThinkingBlock(res, state)
+      closeTextBlock(res, state)
+      for (const record of state.toolCallsByIndex.values()) {
+        closeToolBlock(res, record)
+      }
+      writeSSE(res, "message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: state.outputTokens },
+      })
+      writeSSE(res, "message_stop", {
+        type: "message_stop",
+        usage: {
+          input_tokens: state.inputTokens,
+          output_tokens: state.outputTokens,
+        },
+      })
+    } catch {
+      // Best-effort cleanup; the connection may already be broken
+    }
+  } finally {
+    if (readTimeoutTimer) clearTimeout(readTimeoutTimer)
+    if (clientReq) clientReq.off("close", onClientClose)
   }
-
-  closeThinkingBlock(res, state)
-  closeTextBlock(res, state)
-
-  const orderedToolBlocks = Array.from(state.toolCallsByIndex.entries())
-    .sort((a, b) => a[0] - b[0])
-    .map(([, record]) => record)
-  for (const record of orderedToolBlocks) {
-    closeToolBlock(res, record)
-  }
-
-  const stopReason = mapFinishReason(state.finishReason, state.hadToolCalls)
-  writeSSE(res, "message_delta", {
-    type: "message_delta",
-    delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { output_tokens: state.outputTokens },
-  })
-  writeSSE(res, "message_stop", {
-    type: "message_stop",
-    usage: {
-      input_tokens: state.inputTokens,
-      output_tokens: state.outputTokens,
-    },
-  })
   res.end()
 }
 
@@ -634,16 +728,23 @@ function sendAnthropicError(res, status, type, message) {
   )
 }
 
-async function forwardToGLM(openAIReq) {
+async function forwardToGLM(openAIReq, timeoutMs = 300000) {
   const glmUrl = `${GLM_API_BASE}/chat/completions`
-  return fetch(glmUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GLM_API_KEY}`,
-    },
-    body: JSON.stringify(openAIReq),
-  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(glmUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${GLM_API_KEY}`,
+      },
+      body: JSON.stringify(openAIReq),
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 // ============================================================
@@ -708,11 +809,18 @@ const server = http.createServer(async (req, res) => {
       )
 
       const openAIReq = convertAnthropicToOpenAI(anthropicReq)
-      openAIReq.model = model
+      openAIReq.model = DEFAULT_MODEL
 
       const glmResp = await forwardToGLM(openAIReq)
       if (!glmResp.ok) {
-        const errText = await glmResp.text()
+        let errText
+        try {
+          errText = await glmResp.text()
+        } catch (textErr) {
+          errText = isTerminationError(textErr)
+            ? "(connection terminated while reading error response)"
+            : `(failed to read error body: ${textErr instanceof Error ? textErr.message : String(textErr)})`
+        }
         console.error(`[GLM Proxy] GLM API error: ${glmResp.status} ${errText}`)
         sendAnthropicError(
           res,
@@ -724,11 +832,23 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (anthropicReq.stream) {
-        await streamOpenAIToAnthropic(glmResp, res, model)
+        await streamOpenAIToAnthropic(glmResp, res, model, req)
         return
       }
 
-      const openAIData = await glmResp.json()
+      let openAIData
+      try {
+        openAIData = await glmResp.json()
+      } catch (jsonErr) {
+        if (isTerminationError(jsonErr)) {
+          console.warn(`[GLM Proxy] Non-stream response terminated: ${jsonErr instanceof Error ? jsonErr.message : String(jsonErr)}`)
+          if (!res.headersSent) {
+            sendAnthropicError(res, 502, "api_error", "GLM API connection was terminated before response completed")
+          }
+          return
+        }
+        throw jsonErr
+      }
       const anthropicResp = convertOpenAIToAnthropic(openAIData, model)
       console.log(
         `[GLM Proxy] Response: stop_reason=${anthropicResp.stop_reason}, content_blocks=${anthropicResp.content?.length || 0}`,
@@ -737,13 +857,23 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(anthropicResp))
       return
     } catch (err) {
-      console.error("[GLM Proxy] Request handling error:", err)
-      sendAnthropicError(
-        res,
-        500,
-        "server_error",
-        `Proxy error: ${err instanceof Error ? err.message : String(err)}`,
-      )
+      if (isTerminationError(err)) {
+        console.warn(`[GLM Proxy] Request aborted (${err instanceof Error ? err.message : String(err)})`)
+      } else {
+        console.error("[GLM Proxy] Request handling error:", err)
+      }
+      if (res.headersSent) {
+        // Headers already sent (e.g. streaming started); cannot send a new response
+        console.error("[GLM Proxy] Cannot send error response - headers already sent. Ending connection.")
+        try { res.end() } catch { /* ignore */ }
+      } else {
+        sendAnthropicError(
+          res,
+          500,
+          "server_error",
+          `Proxy error: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
       return
     }
   }

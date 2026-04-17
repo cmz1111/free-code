@@ -133,6 +133,25 @@ const DEFAULT_TEMPERATURE = parseFloatValue(
   getSetting("GLM_TEMPERATURE", "0.2"),
   0.2,
 )
+const STREAM_READ_TIMEOUT = parseInteger(
+  getSetting("GLM_STREAM_READ_TIMEOUT", "120000"),
+  120000,
+)
+
+function isTerminationError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === "AbortError") return true
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase()
+    return (
+      msg.includes("terminated") ||
+      msg.includes("aborted") ||
+      msg.includes("cancel") ||
+      msg.includes("timeout") ||
+      msg.includes("client disconnected")
+    )
+  }
+  return false
+}
 
 if (!GLM_API_KEY) {
   console.error("[GLM Proxy] Missing GLM_API_KEY.")
@@ -566,7 +585,11 @@ function closeToolBlock(
   record.closed = true
 }
 
-async function streamOpenAIToAnthropic(glmResp: Response, model: string): Promise<Response> {
+async function streamOpenAIToAnthropic(
+  glmResp: Response,
+  model: string,
+  clientSignal?: AbortSignal,
+): Promise<Response> {
   const messageId = generateId()
 
   const readable = new ReadableStream<Uint8Array>({
@@ -606,147 +629,243 @@ async function streamOpenAIToAnthropic(glmResp: Response, model: string): Promis
         ),
       )
 
-      const decoder = new TextDecoder()
-      let buffer = ""
+      // Stream-level abort controller: aborts when client disconnects or read times out
+      const streamAbort = new AbortController()
+      let readTimeoutTimer = setTimeout(() => {
+        console.warn("[GLM Proxy] Stream read timeout — aborting upstream reader")
+        streamAbort.abort()
+      }, STREAM_READ_TIMEOUT)
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) {
-          break
+      if (clientSignal) {
+        if (clientSignal.aborted) {
+          clearTimeout(readTimeoutTimer)
+          reader.cancel().catch(() => {})
+          controller.close()
+          return
         }
+        clientSignal.addEventListener(
+          "abort",
+          () => {
+            console.warn("[GLM Proxy] Client disconnected — aborting upstream reader")
+            clearTimeout(readTimeoutTimer)
+            streamAbort.abort()
+          },
+          { once: true },
+        )
+      }
 
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split(/\r?\n/)
-        buffer = lines.pop() || ""
+      try {
+        const decoder = new TextDecoder()
+        let buffer = ""
 
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed || trimmed.startsWith(":") || !trimmed.startsWith("data: ")) {
-            continue
-          }
-
-          const payload = trimmed.slice(6)
-          if (payload === "[DONE]") {
-            continue
-          }
-
-          let data: any
+        while (!streamAbort.signal.aborted) {
+          let readResult: { done: boolean; value?: Uint8Array }
           try {
-            data = JSON.parse(payload)
-          } catch {
-            continue
+            readResult = await Promise.race([
+              reader.read(),
+              new Promise<never>((_, reject) => {
+                streamAbort.signal.addEventListener("abort", () => {
+                  reject(new DOMException("Stream read aborted", "AbortError"))
+                })
+              }),
+            ])
+          } catch (readErr) {
+            if (
+              readErr instanceof DOMException &&
+              readErr.name === "AbortError"
+            ) {
+              break
+            }
+            throw readErr
           }
 
-          const choice = data.choices?.[0] || {}
-          const delta = choice.delta || {}
-
-          if (choice.finish_reason) {
-            state.finishReason = choice.finish_reason
+          const { done, value } = readResult
+          if (done) {
+            break
           }
 
-          if (data.usage) {
-            state.inputTokens = data.usage.prompt_tokens || state.inputTokens
-            state.outputTokens = data.usage.completion_tokens || state.outputTokens
-          }
+          // Reset read timeout on each successful chunk
+          clearTimeout(readTimeoutTimer)
+          readTimeoutTimer = setTimeout(() => {
+            console.warn("[GLM Proxy] Stream read timeout — aborting upstream reader")
+            streamAbort.abort()
+          }, STREAM_READ_TIMEOUT)
 
-          if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
-            const index = ensureThinkingBlock(controller, encoder, state)
-            controller.enqueue(
-              encoder.encode(
-                formatSSE("content_block_delta", {
-                  type: "content_block_delta",
-                  index,
-                  delta: {
-                    type: "thinking_delta",
-                    thinking: delta.reasoning_content,
-                  },
-                }),
-              ),
-            )
-          }
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split(/\r?\n/)
+          buffer = lines.pop() || ""
 
-          if (typeof delta.content === "string" && delta.content) {
-            closeThinkingBlock(controller, encoder, state)
-            const index = ensureTextBlock(controller, encoder, state)
-            controller.enqueue(
-              encoder.encode(
-                formatSSE("content_block_delta", {
-                  type: "content_block_delta",
-                  index,
-                  delta: { type: "text_delta", text: delta.content },
-                }),
-              ),
-            )
-          }
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(":") || !trimmed.startsWith("data: ")) {
+              continue
+            }
 
-          if (Array.isArray(delta.tool_calls)) {
-            for (const toolCall of delta.tool_calls) {
-              const toolIndex =
-                typeof toolCall.index === "number"
-                  ? toolCall.index
-                  : state.toolCallsByIndex.size
-              const record = ensureToolBlock(
-                controller,
-                encoder,
-                state,
-                toolIndex,
-                toolCall,
+            const payload = trimmed.slice(6)
+            if (payload === "[DONE]") {
+              continue
+            }
+
+            let data: any
+            try {
+              data = JSON.parse(payload)
+            } catch {
+              continue
+            }
+
+            const choice = data.choices?.[0] || {}
+            const delta = choice.delta || {}
+
+            if (choice.finish_reason) {
+              state.finishReason = choice.finish_reason
+            }
+
+            if (data.usage) {
+              state.inputTokens = data.usage.prompt_tokens || state.inputTokens
+              state.outputTokens = data.usage.completion_tokens || state.outputTokens
+            }
+
+            if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+              const index = ensureThinkingBlock(controller, encoder, state)
+              controller.enqueue(
+                encoder.encode(
+                  formatSSE("content_block_delta", {
+                    type: "content_block_delta",
+                    index,
+                    delta: {
+                      type: "thinking_delta",
+                      thinking: delta.reasoning_content,
+                    },
+                  }),
+                ),
               )
-              state.hadToolCalls = true
+            }
 
-              if (toolCall.function?.arguments) {
-                record.argumentsText += toolCall.function.arguments
-                controller.enqueue(
-                  encoder.encode(
-                    formatSSE("content_block_delta", {
-                      type: "content_block_delta",
-                      index: record.index,
-                      delta: {
-                        type: "input_json_delta",
-                        partial_json: toolCall.function.arguments,
-                      },
-                    }),
-                  ),
+            if (typeof delta.content === "string" && delta.content) {
+              closeThinkingBlock(controller, encoder, state)
+              const index = ensureTextBlock(controller, encoder, state)
+              controller.enqueue(
+                encoder.encode(
+                  formatSSE("content_block_delta", {
+                    type: "content_block_delta",
+                    index,
+                    delta: { type: "text_delta", text: delta.content },
+                  }),
+                ),
+              )
+            }
+
+            if (Array.isArray(delta.tool_calls)) {
+              for (const toolCall of delta.tool_calls) {
+                const toolIndex =
+                  typeof toolCall.index === "number"
+                    ? toolCall.index
+                    : state.toolCallsByIndex.size
+                const record = ensureToolBlock(
+                  controller,
+                  encoder,
+                  state,
+                  toolIndex,
+                  toolCall,
                 )
+                state.hadToolCalls = true
+
+                if (toolCall.function?.arguments) {
+                  record.argumentsText += toolCall.function.arguments
+                  controller.enqueue(
+                    encoder.encode(
+                      formatSSE("content_block_delta", {
+                        type: "content_block_delta",
+                        index: record.index,
+                        delta: {
+                          type: "input_json_delta",
+                          partial_json: toolCall.function.arguments,
+                        },
+                      }),
+                    ),
+                  )
+                }
               }
             }
           }
         }
+
+        closeThinkingBlock(controller, encoder, state)
+        closeTextBlock(controller, encoder, state)
+
+        const orderedToolBlocks = Array.from(state.toolCallsByIndex.entries())
+          .sort((a, b) => a[0] - b[0])
+          .map(([, record]) => record)
+        for (const record of orderedToolBlocks) {
+          closeToolBlock(controller, encoder, record)
+        }
+
+        controller.enqueue(
+          encoder.encode(
+            formatSSE("message_delta", {
+              type: "message_delta",
+              delta: {
+                stop_reason: mapFinishReason(state.finishReason, state.hadToolCalls),
+                stop_sequence: null,
+              },
+              usage: { output_tokens: state.outputTokens },
+            }),
+          ),
+        )
+        controller.enqueue(
+          encoder.encode(
+            formatSSE("message_stop", {
+              type: "message_stop",
+              usage: {
+                input_tokens: state.inputTokens,
+                output_tokens: state.outputTokens,
+              },
+            }),
+          ),
+        )
+      } catch (streamErr) {
+        if (isTerminationError(streamErr)) {
+          // Client disconnect or upstream termination — not a bug, just log at info level
+          console.warn(
+            `[GLM Proxy] Stream ended prematurely (${streamErr instanceof Error ? streamErr.message : String(streamErr)})`,
+          )
+        } else {
+          console.error("[GLM Proxy] Stream error:", streamErr)
+        }
+        // Best-effort cleanup via the ReadableStream controller
+        try {
+          closeThinkingBlock(controller, encoder, state)
+          closeTextBlock(controller, encoder, state)
+          for (const record of state.toolCallsByIndex.values()) {
+            closeToolBlock(controller, encoder, record)
+          }
+          controller.enqueue(
+            encoder.encode(
+              formatSSE("message_delta", {
+                type: "message_delta",
+                delta: { stop_reason: "end_turn", stop_sequence: null },
+                usage: { output_tokens: state.outputTokens },
+              }),
+            ),
+          )
+          controller.enqueue(
+            encoder.encode(
+              formatSSE("message_stop", {
+                type: "message_stop",
+                usage: {
+                  input_tokens: state.inputTokens,
+                  output_tokens: state.outputTokens,
+                },
+              }),
+            ),
+          )
+        } catch {
+          // Best-effort cleanup; the stream may already be closed
+        }
+      } finally {
+        clearTimeout(readTimeoutTimer)
+        reader.cancel().catch(() => {})
       }
-
-      closeThinkingBlock(controller, encoder, state)
-      closeTextBlock(controller, encoder, state)
-
-      const orderedToolBlocks = Array.from(state.toolCallsByIndex.entries())
-        .sort((a, b) => a[0] - b[0])
-        .map(([, record]) => record)
-      for (const record of orderedToolBlocks) {
-        closeToolBlock(controller, encoder, record)
-      }
-
-      controller.enqueue(
-        encoder.encode(
-          formatSSE("message_delta", {
-            type: "message_delta",
-            delta: {
-              stop_reason: mapFinishReason(state.finishReason, state.hadToolCalls),
-              stop_sequence: null,
-            },
-            usage: { output_tokens: state.outputTokens },
-          }),
-        ),
-      )
-      controller.enqueue(
-        encoder.encode(
-          formatSSE("message_stop", {
-            type: "message_stop",
-            usage: {
-              input_tokens: state.inputTokens,
-              output_tokens: state.outputTokens,
-            },
-          }),
-        ),
-      )
       controller.close()
     },
   })
@@ -761,16 +880,45 @@ async function streamOpenAIToAnthropic(glmResp: Response, model: string): Promis
   })
 }
 
-async function forwardToGLM(openAIReq: OpenAIRequest): Promise<Response> {
+async function forwardToGLM(
+  openAIReq: OpenAIRequest,
+  timeoutMs: number = 300000,
+  clientSignal?: AbortSignal,
+): Promise<Response> {
   const glmUrl = `${GLM_API_BASE}/chat/completions`
-  return fetch(glmUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GLM_API_KEY}`,
-    },
-    body: JSON.stringify(openAIReq),
-  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  // Also abort upstream if the client disconnects during the initial fetch
+  if (clientSignal) {
+    if (clientSignal.aborted) {
+      clearTimeout(timer)
+      controller.abort()
+    } else {
+      clientSignal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer)
+          controller.abort()
+        },
+        { once: true },
+      )
+    }
+  }
+
+  try {
+    return await fetch(glmUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${GLM_API_KEY}`,
+      },
+      body: JSON.stringify(openAIReq),
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 const server = Bun.serve({
@@ -835,11 +983,18 @@ const server = Bun.serve({
         )
 
         const openAIReq = convertAnthropicToOpenAI(anthropicReq)
-        openAIReq.model = model
+        openAIReq.model = DEFAULT_MODEL
 
-        const glmResp = await forwardToGLM(openAIReq)
+        const glmResp = await forwardToGLM(openAIReq, 300000, req.signal)
         if (!glmResp.ok) {
-          const errText = await glmResp.text()
+          let errText: string
+          try {
+            errText = await glmResp.text()
+          } catch (textErr) {
+            errText = isTerminationError(textErr)
+              ? "(connection terminated while reading error response)"
+              : `(failed to read error body: ${textErr instanceof Error ? textErr.message : String(textErr)})`
+          }
           console.error(`[GLM Proxy] GLM API error: ${glmResp.status} ${errText}`)
           return new Response(
             JSON.stringify({
@@ -857,10 +1012,33 @@ const server = Bun.serve({
         }
 
         if (anthropicReq.stream) {
-          return await streamOpenAIToAnthropic(glmResp, model)
+          return await streamOpenAIToAnthropic(glmResp, model, req.signal)
         }
 
-        const openAIData = await glmResp.json()
+        let openAIData: any
+        try {
+          openAIData = await glmResp.json()
+        } catch (jsonErr) {
+          if (isTerminationError(jsonErr)) {
+            console.warn(
+              `[GLM Proxy] Non-stream response terminated: ${jsonErr instanceof Error ? jsonErr.message : String(jsonErr)}`,
+            )
+            return new Response(
+              JSON.stringify({
+                type: "error",
+                error: {
+                  type: "api_error",
+                  message: "GLM API connection was terminated before response completed",
+                },
+              }),
+              {
+                status: 502,
+                headers: { "Content-Type": "application/json" },
+              },
+            )
+          }
+          throw jsonErr
+        }
         const anthropicResp = convertOpenAIToAnthropic(openAIData, model)
         console.log(
           `[GLM Proxy] Response: stop_reason=${String(
@@ -871,7 +1049,15 @@ const server = Bun.serve({
           headers: { "Content-Type": "application/json" },
         })
       } catch (err) {
-        console.error("[GLM Proxy] Request handling error:", err)
+        if (isTerminationError(err)) {
+          console.warn(
+            `[GLM Proxy] Request aborted (${err instanceof Error ? err.message : String(err)})`,
+          )
+        } else {
+          console.error("[GLM Proxy] Request handling error:", err)
+        }
+        // In the Bun version headers are managed by the Response object,
+        // so double-write is unlikely, but we still return a safe error.
         return new Response(
           JSON.stringify({
             type: "error",

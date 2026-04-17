@@ -45,6 +45,7 @@ import {
   buildSessionMemoryUpdatePrompt,
   loadSessionMemoryTemplate,
 } from './prompts.js'
+import { isEnvTruthy } from '../../utils/envUtils.js'
 import {
   DEFAULT_SESSION_MEMORY_CONFIG,
   getSessionMemoryConfig,
@@ -76,8 +77,12 @@ import {
 /**
  * Check if session memory feature is enabled.
  * Uses cached gate value - returns immediately without blocking.
+ * In OSS builds where GrowthBook is disabled, set CLAUDE_SESSION_MEMORY_ENABLED=1 to enable.
  */
 function isSessionMemoryGateEnabled(): boolean {
+  if (isEnvTruthy(process.env.CLAUDE_SESSION_MEMORY_ENABLED)) {
+    return true
+  }
   return getFeatureValue_CACHED_MAY_BE_STALE('tengu_session_memory', false)
 }
 

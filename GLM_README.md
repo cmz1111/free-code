@@ -52,6 +52,7 @@ cp .env.glm.example .env.glm
 | `GLM_API_BASE` | 智谱接口基础地址 | `https://open.bigmodel.cn/api/coding/paas/v4` |
 | `GLM_MAX_TOKENS` | 最大输出 token 数 | `131072` |
 | `GLM_TEMPERATURE` | 温度参数 | `0.2` |
+| `Z_AI_API_KEY` | 视觉 MCP 专用 API Key（与 GLM_API_KEY 不同） | 视觉 MCP 可选 |
 | `FREE_CODE_DEFAULT_DIR` | 默认工作目录，未传目录参数时生效 | 脚本所在目录 |
 
 ## 快速开始
@@ -217,6 +218,62 @@ node ./glm-proxy.mjs
 | `start-free-code.bat` | Windows 启动脚本 |
 | `start-free-code.sh` | Linux/macOS 启动脚本 |
 | `.env.glm.example` | 本地配置样例文件 |
+| `.mcp.json` | GLM 视觉 MCP 服务器配置 |
+
+## 视觉 MCP（GLM Vision）
+
+项目已集成智谱官方视觉 MCP 服务器 `@z_ai/mcp-server`，提供以下视觉能力：
+
+| 工具 | 说明 |
+|------|------|
+| `ui_to_artifact` | 将 UI 截图转换为代码、提示词、设计规范或自然语言描述 |
+| `extract_text_from_screenshot` | 使用 OCR 从截图中提取和识别文字（代码、终端输出、文档等） |
+| `diagnose_error_screenshot` | 解析错误弹窗、堆栈和日志截图，给出定位与修复建议 |
+| `understand_technical_diagram` | 针对架构图、流程图、UML、ER 图等技术图纸生成结构化解读 |
+| `analyze_data_visualization` | 阅读仪表盘、统计图表，提炼趋势、异常与业务要点 |
+| `ui_diff_check` | 对比两张 UI 截图，识别视觉差异和实现偏差 |
+| `image_analysis` | 通用图像理解能力，适配未被专项工具覆盖的视觉内容 |
+| `video_analysis` | 支持 MP4/MOV/M4V（限制本地最大 8M）等格式的视频场景解析 |
+
+### 配置方式
+
+1. 确保 `.env.glm` 中配置了 `Z_AI_API_KEY`（与 `GLM_API_KEY` 不同，这是视觉 MCP 专用 key）：
+
+```dotenv
+Z_AI_API_KEY=your_z_ai_api_key_here
+```
+
+2. 项目根目录的 `.mcp.json` 已配置好 `glm-vision` MCP 服务器，无需手动修改。
+
+### 使用方式
+
+启动 free-code 后，当你向模型发送涉及图片/截图/视频分析的请求时，模型会自动调用 `mcp__glm-vision__` 前缀的视觉工具。例如：
+
+- "帮我分析一下这个截图中的错误信息"
+- "把这张 UI 设计图转成 React 代码"
+- "解读一下这个架构图"
+- "对比这两张截图有什么不同"
+
+你可以将图片文件路径告诉模型，模型会调用对应的视觉工具进行分析。
+
+### 跨项目使用
+
+`.mcp.json` 位于 free-code 根目录。free-code 会从当前工作目录向上遍历查找 `.mcp.json`，因此：
+
+- **默认情况**（工作目录为 free-code 根目录或其子目录）：视觉 MCP 自动可用
+- **其他项目目录**：需要将 `glm-vision` 配置添加到目标项目的 `.mcp.json` 中，或通过命令注册到用户级配置：
+
+```bash
+# 在 free-code 交互模式中执行（将 glm-vision 注册到用户级，所有项目可用）
+/mcp add --scope user -e Z_AI_API_KEY=$Z_AI_API_KEY glm-vision -- npx -y @z_ai/mcp-server
+```
+
+### 注意事项
+
+- `Z_AI_API_KEY` 是独立的 API Key，与 `GLM_API_KEY` 不同
+- 环境变量 `Z_AI_MODE` 保持默认 `ZHIPU` 即可
+- 前提条件：Node.js >= v18.0.0
+- 如果视觉工具不可用，检查 `Z_AI_API_KEY` 是否正确配置
 
 ## 排查建议
 
@@ -231,3 +288,9 @@ node ./glm-proxy.mjs
 1. `GLM_API_KEY` 是否已设置
 2. `node` 和 `bun` 是否在 `PATH` 中
 3. `GLM_PROXY_PORT` 是否被其他进程占用
+
+如果视觉 MCP 工具不可用，优先检查：
+
+1. `Z_AI_API_KEY` 是否已在 `.env.glm` 或环境变量中配置
+2. 运行 `npx -y @z_ai/mcp-server` 确认包是否正常
+3. 检查 `.mcp.json` 是否在当前工作目录或其父目录中
