@@ -4,3 +4,4 @@ cli
 cli-dev
 openclaw/
 .env.glm
+cli.exe

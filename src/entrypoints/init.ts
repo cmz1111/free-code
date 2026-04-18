@@ -74,7 +74,10 @@ export const init = memoize(async (): Promise<void> => {
 
     // Populate OAuth account info if it is not already cached in config. This is needed since the
     // OAuth account info may not be populated when logging in through the VSCode extension.
-    void populateOAuthAccountInfoIfNeeded()
+    // Skip when using a local proxy (e.g., GLM proxy) — no real Anthropic auth to populate.
+    if (!process.env.ANTHROPIC_BASE_URL?.startsWith('http://localhost') && !process.env.ANTHROPIC_BASE_URL?.startsWith('http://127.0.0.1')) {
+      void populateOAuthAccountInfoIfNeeded()
+    }
     profileCheckpoint('init_after_oauth_populate')
 
     // Initialize JetBrains IDE detection asynchronously (populates cache for later sync access)

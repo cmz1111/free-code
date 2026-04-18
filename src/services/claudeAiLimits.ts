@@ -223,6 +223,12 @@ export async function checkQuotaStatus(): Promise<void> {
     return
   }
 
+  // Skip when using a local proxy (e.g., GLM proxy) — no real Anthropic API to check quota against
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || ''
+  if (baseUrl.startsWith('http://localhost') || baseUrl.startsWith('http://127.0.0.1')) {
+    return
+  }
+
   // Check if we should process rate limits (real subscriber or mock testing)
   if (!shouldProcessRateLimits(isClaudeAISubscriber())) {
     return

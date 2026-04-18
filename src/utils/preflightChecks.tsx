@@ -15,6 +15,11 @@ export interface PreflightCheckResult {
   sslHint?: string;
 }
 async function checkEndpoints(): Promise<PreflightCheckResult> {
+  // Skip connectivity check when using a local proxy — no Anthropic servers needed
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
+  if (baseUrl.startsWith('http://localhost') || baseUrl.startsWith('http://127.0.0.1')) {
+    return { success: true };
+  }
   try {
     const oauthConfig = getOauthConfig();
     const tokenUrl = new URL(oauthConfig.TOKEN_URL);

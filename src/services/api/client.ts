@@ -137,7 +137,11 @@ export async function getAnthropicClient({
   }
 
   logForDebugging('[API:auth] OAuth token check starting')
-  await checkAndRefreshOAuthTokenIfNeeded()
+  // Skip OAuth refresh when using a local proxy — no real Anthropic auth needed
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || ''
+  if (!baseUrl.startsWith('http://localhost') && !baseUrl.startsWith('http://127.0.0.1')) {
+    await checkAndRefreshOAuthTokenIfNeeded()
+  }
   logForDebugging('[API:auth] OAuth token check complete')
 
   if (!isClaudeAISubscriber()) {
