@@ -59,6 +59,17 @@ export function preconnectAnthropicApi(): void {
   const baseUrl =
     process.env.ANTHROPIC_BASE_URL || getOauthConfig().BASE_API_URL
 
+  // Skip preconnect when using a local proxy (e.g., GLM proxy) — the local
+  // server is already warm and a HEAD request to it is pointless.
+  try {
+    const url = new URL(baseUrl)
+    if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
+      return
+    }
+  } catch {
+    // If URL parsing fails, continue with preconnect
+  }
+
   // Fire and forget. HEAD means no response body — the connection is eligible
   // for keep-alive pool reuse immediately after headers arrive. 10s timeout
   // so a slow network doesn't hang the process; abort is fine since the real

@@ -45,6 +45,13 @@ async function fetchBootstrapAPI(): Promise<BootstrapResponse | null> {
     return null
   }
 
+  // Skip when using a local proxy (e.g., GLM proxy) — no real Anthropic API to bootstrap from
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || ''
+  if (baseUrl.startsWith('http://localhost') || baseUrl.startsWith('http://127.0.0.1')) {
+    logForDebugging('[Bootstrap] Skipped: local proxy detected')
+    return null
+  }
+
   if (getAPIProvider() !== 'firstParty') {
     logForDebugging('[Bootstrap] Skipped: 3P provider')
     return null

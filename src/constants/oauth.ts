@@ -262,5 +262,15 @@ export function getOauthConfig(): OauthConfig {
     }
   }
 
+  // When using a local proxy (e.g., GLM proxy), override BASE_API_URL to
+  // prevent any code path from accidentally reaching api.anthropic.com.
+  const baseUrl = process.env.ANTHROPIC_BASE_URL
+  if (baseUrl && (baseUrl.startsWith('http://localhost') || baseUrl.startsWith('http://127.0.0.1'))) {
+    config = {
+      ...config,
+      BASE_API_URL: baseUrl.replace(/\/$/, ''),
+    }
+  }
+
   return config
 }
